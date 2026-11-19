@@ -16,6 +16,8 @@
 local bufPlayer   = console:createBuffer("Player")
 local bufTeam     = console:createBuffer("Team")
 local bufBag      = console:createBuffer("Bag")
+local bufPCBoxes  = console:createBuffer("PC Boxes")
+local bufPCItems  = console:createBuffer("PC Items")
 local bufPokedex  = console:createBuffer("Pokedex")
 local bufLocation = console:createBuffer("Location")
 local bufWild     = console:createBuffer("Wild")
@@ -29,6 +31,12 @@ bufPokedex:setSize(40, 160)
 bufPlayer:setSize(100, 30)  -- long "Fly destinations" line + 9 badge lines
 bufTeam:setSize(60, 90)   -- up to 6 Pokemon x ~12 lines each
 bufBag:setSize(60, 30)    -- up to 20 items + header
+bufPCItems:setSize(60, 60)    -- up to 50 items + header
+bufPCBoxes:setSize(100, 770)  -- 12 boxes x (header + up to 20 Pokemon x 3 lines)
+
+-- The GUI connects to this TCP port on 127.0.0.1 (localhost only). If it's taken,
+-- the next few ports are tried; the Console tab says which one was used.
+local SERVER_PORT = 8765
 
 -- RAM (WRAM) addresses
 local wIsInBattle    = 0xD056  -- 0 = no battle, 1 = wild, 2 = trainer
@@ -36,7 +44,6 @@ local wEnemyMonNick  = 0xCFD9  -- 11 bytes, 0x50-terminated
 local wEnemyMon      = 0xCFE4  -- start of the active enemy's battle struct
 local wGrassRate     = 0xD886  -- encounter rate for grass on this map (0 = none)
 local wGrassMons     = 0xD887  -- 10 entries of {level, species}
-local wBagItems      = 0xD31D  -- Items in Bag
 local wPlayerMoney   = 0xD346  -- 3 bytes, BCD (¥3175 is stored as 00 31 75)
 local wObtainedBadges = 0xD355 -- 1 byte, one bit per badge (bit 0 = Boulder ... bit 7 = Earth)
 
@@ -81,10 +88,64 @@ local PARTY_DATA_END = 0xD2F6  -- end of the nicknames (used to detect changes)
 -- Bag
 local wNumBagItems   = 0xD31C  -- number of different items
 local wBagItems      = 0xD31D  -- {item ID, quantity} pairs, 0xFF-terminated, max 20
+local BAG_ITEM_CAPACITY = 20
+
+-- PC (Bill's PC)
+local wNumBoxItems     = 0xD539  -- number of different items stored in the PC
+local wBoxItems        = 0xD53A  -- {item ID, quantity} pairs, 0xFF-terminated, max 50
+local PC_ITEM_CAPACITY = 50
+local wCurrentBoxNum   = 0xD59F  -- bits 0-6: box number (0-11); bit 7: player has changed boxes before
+-- Only the current box lives in WRAM (wBoxDataStart-wBoxDataEnd). All 12 boxes are kept in
+-- cartridge SRAM (sBox1-sBox12) with the same layout; the current box's SRAM copy is only
+-- updated when the game saves, so the WRAM copy is the live one.
+local wBoxDataStart    = 0xDA7F  -- wBoxCount (1 byte), then wBoxSpecies (21 bytes)
+local wBoxMons         = 0xDA95  -- 20 x 33-byte box_struct
+local wBoxMonOT        = 0xDD29  -- 20 x 11-byte original trainer names
+local wBoxMonNicks     = 0xDE05  -- 20 x 11-byte nicknames
+local wBoxDataEnd      = 0xDEE1
+local BOX_SIZE         = wBoxDataEnd - wBoxDataStart   -- 0x462
+local BOX_MON_SIZE     = 33      -- BOXMON_STRUCT_LENGTH
+local MONS_PER_BOX     = 20
+local NUM_BOXES        = 12
+-- sBox1-sBox6 are at 02:A000, 02:A462, ... and sBox7-sBox12 at the same addresses in bank 3.
+-- mGBA's "sram" memory domain lays the 8 KiB banks out back to back (bank n at n * 0x2000).
+local function sBoxOffset(box)   -- box = 1-12
+    local bank = box <= 6 and 2 or 3
+    return bank * 0x2000 + ((box - 1) % 6) * BOX_SIZE
+end
+
+-- Read from cartridge SRAM. The game keeps SRAM switched off except while saving
+-- (EnableSRAM/DisableSRAM write to rRAMG), and while it's off every read returns 0xFF.
+-- So: switch it on, read, switch it back off. This all happens inside one frame callback,
+-- so the game never sees the change. If SRAM is already on (the game is mid-save), the
+-- switch is left alone. Only call this once the game has been saved at least once
+-- (the probe byte is meaningless before that).
+local readSRAM
+do
+    local rRAMG             = 0x0000  -- MBC RAM enable register (constants/hardware.inc)
+    local RAMG_SRAM_ENABLE  = 0x0A
+    local RAMG_SRAM_DISABLE = 0x00
+    local SRAM_PROBE        = 0x2598  -- sPlayerName (01:A598): first letter, never 0xFF in a saved game
+
+    function readSRAM(offset, length)
+        local sram = emu.memory.sram
+        if not sram then return nil end
+        if sram:read8(SRAM_PROBE) ~= 0xFF then        -- already on: just read
+            return sram:readRange(offset, length)
+        end
+        emu:write8(rRAMG, RAMG_SRAM_ENABLE)
+        local data = sram:readRange(offset, length)
+        emu:write8(rRAMG, RAMG_SRAM_DISABLE)
+        return data
+    end
+end
 
 -- ROM tables (bank:addr -> bank * 0x4000 + (addr - 0x4000))
 local MoveNames      = 0xBC000 -- 2F:4000, names back to back, each ending in 0x50
 local Moves          = 0x38000 -- 0E:4000, 6 bytes per move: anim, effect, power, type, accuracy, PP
+local BaseStats      = 0x383DE -- 0E:43DE, BASE_DATA_SIZE bytes per Pokemon in Pokedex order (Mew included):
+                               --   dex, hp, atk, def, spd, spc, type1, type2, catch rate, ...
+local BASE_DATA_SIZE = 28
 local ItemPrices     = 0x4494  -- 01:4494, 3-byte BCD price per item
 local TMPrices       = 0xF65F5 -- 3D:65F5, one nybble per TM, in thousands
 local KeyItemFlags   = 0xE6DD  -- 03:66DD, one bit per item: 1 = key item (can't be sold)
@@ -719,48 +780,36 @@ local BATTLE_OFS = { hp = 1, status = 4, type1 = 5, type2 = 6, moves = 8, pp = 2
                      level = 14, maxHP = 15, atk = 17, def = 19, spe = 21, spc = 23 }
 local STAT_EXP_OFS = 17  -- party_struct only: 5 x 2-byte Stat Exp (HP, Atk, Def, Spe, Spc)
 
--- addr/ofs: where to read the Pokemon from (party_struct or battle_struct).
--- statExpAddr: a party_struct to take Stat Exp from, since battle_struct has none.
---   nil = no party data (wild Pokemon), shown as all zeros - which is what they really have.
-local function readMon(addr, ofs, statExpAddr)
-    -- DVs (Gen 1 IVs, 0-15). The HP DV is built from the lowest bit of the other four.
-    local dvs = read16BE(addr + ofs.dvs)
-    local atkDV, defDV, speDV, spcDV = (dvs >> 12) & 0xF, (dvs >> 8) & 0xF, (dvs >> 4) & 0xF, dvs & 0xF
+-- DVs (Gen 1 IVs, 0-15) packed in 2 bytes. The HP DV is built from the lowest bit of the other four.
+local function splitDVs(dvs)
+    local atk, def, spe, spc = (dvs >> 12) & 0xF, (dvs >> 8) & 0xF, (dvs >> 4) & 0xF, dvs & 0xF
+    local hp = ((atk & 1) << 3) | ((def & 1) << 2) | ((spe & 1) << 1) | (spc & 1)
+    return { hp = hp, atk = atk, def = def, spe = spe, spc = spc }
+end
 
-    -- Stat Exp (Gen 1 EVs, 0-65535 each)
-    local se = { 0, 0, 0, 0, 0 }
-    if statExpAddr then
-        for s = 1, 5 do se[s] = read16BE(statExpAddr + STAT_EXP_OFS + (s - 1) * 2) end
-    end
-
-    local species = emu:read8(addr)
-    local hp      = read16BE(addr + ofs.hp)
-    local status  = emu:read8(addr + ofs.status)
-    local type1, type2 = emu:read8(addr + ofs.type1), emu:read8(addr + ofs.type2)
-
+-- Build the Pokemon table every tab and the GUI use, from raw struct values:
+--   species, hp, maxHP, level, status, type1, type2, atk, def, spe, spc,
+--   dvs (packed 2 bytes), statExp {hp, atk, def, spe, spc}, moves {4 IDs}, pp {4 raw PP bytes}
+local function buildMon(raw)
     local mon = {
-        species   = species,                 -- internal ID
-        name      = speciesName(species),
-        dex       = dexNumber(species),
-        level     = emu:read8(addr + ofs.level),
-        hp        = hp,
-        maxHP     = read16BE(addr + ofs.maxHP),
-        status    = status,                  -- raw status byte
-        condition = statusText(status, hp),  -- "OK", "FNT", "SLP", ...
-        types     = typeNames(type1, type2),
-        atk = read16BE(addr + ofs.atk), def = read16BE(addr + ofs.def),
-        spe = read16BE(addr + ofs.spe), spc = read16BE(addr + ofs.spc),
-        dv = {
-            hp  = ((atkDV & 1) << 3) | ((defDV & 1) << 2) | ((speDV & 1) << 1) | (spcDV & 1),
-            atk = atkDV, def = defDV, spe = speDV, spc = spcDV,
-        },
-        statExp = { hp = se[1], atk = se[2], def = se[3], spe = se[4], spc = se[5] },
+        species   = raw.species,                     -- internal ID
+        name      = speciesName(raw.species),
+        dex       = dexNumber(raw.species),
+        level     = raw.level,
+        hp        = raw.hp,
+        maxHP     = raw.maxHP,
+        status    = raw.status,                      -- raw status byte
+        condition = statusText(raw.status, raw.hp),  -- "OK", "FNT", "SLP", ...
+        types     = typeNames(raw.type1, raw.type2),
+        atk = raw.atk, def = raw.def, spe = raw.spe, spc = raw.spc,
+        dv = splitDVs(raw.dvs),
+        statExp = raw.statExp,                       -- Stat Exp (Gen 1 EVs, 0-65535 each)
         moves = {},
     }
-    for m = 0, 3 do
-        local move = emu:read8(addr + ofs.moves + m)
+    for m = 1, 4 do
+        local move = raw.moves[m]
         if move ~= 0 then
-            local ppByte = emu:read8(addr + ofs.pp + m)
+            local ppByte = raw.pp[m]
             local basePP = emu.memory.cart0:read8(Moves + (move - 1) * 6 + 5)
             mon.moves[#mon.moves + 1] = {
                 id    = move,
@@ -771,6 +820,100 @@ local function readMon(addr, ofs, statExpAddr)
         end
     end
     return mon
+end
+
+-- addr/ofs: where to read the Pokemon from (party_struct or battle_struct).
+-- statExpAddr: a party_struct to take Stat Exp from, since battle_struct has none.
+--   nil = no party data (wild Pokemon), shown as all zeros - which is what they really have.
+local function readMon(addr, ofs, statExpAddr)
+    local se = { 0, 0, 0, 0, 0 }
+    if statExpAddr then
+        for s = 1, 5 do se[s] = read16BE(statExpAddr + STAT_EXP_OFS + (s - 1) * 2) end
+    end
+    local raw = {
+        species = emu:read8(addr),
+        hp      = read16BE(addr + ofs.hp),
+        maxHP   = read16BE(addr + ofs.maxHP),
+        level   = emu:read8(addr + ofs.level),
+        status  = emu:read8(addr + ofs.status),
+        type1   = emu:read8(addr + ofs.type1),
+        type2   = emu:read8(addr + ofs.type2),
+        atk = read16BE(addr + ofs.atk), def = read16BE(addr + ofs.def),
+        spe = read16BE(addr + ofs.spe), spc = read16BE(addr + ofs.spc),
+        dvs     = read16BE(addr + ofs.dvs),
+        statExp = { hp = se[1], atk = se[2], def = se[3], spe = se[4], spc = se[5] },
+        moves = {}, pp = {},
+    }
+    for m = 1, 4 do
+        raw.moves[m] = emu:read8(addr + ofs.moves + m - 1)
+        raw.pp[m]    = emu:read8(addr + ofs.pp + m - 1)
+    end
+    return buildMon(raw)
+end
+
+-- Gen 1 stat formula (CalcStat in the disassembly). Stat Exp counts as
+-- ceil(sqrt(statExp)), capped at 255, then divided by 4.
+local function calcStat(base, dv, statExp, level, isHP)
+    local root = 0
+    while root < 255 and root * root < statExp do root = root + 1 end
+    local value = (((base + dv) * 2 + root // 4) * level) // 100
+    if isHP then return value + level + 10 end
+    return value + 5
+end
+
+-- Box Pokemon don't store their level-based stats (box_struct has no MaxHP/Attack/...);
+-- the game recalculates them from base stats, DVs, Stat Exp and level, so do the same.
+local function calcStats(species, level, dvs, statExp)
+    local dex = dexNumber(species)
+    if dex < 1 or dex > NUM_POKEMON then
+        return { hp = 0, atk = 0, def = 0, spe = 0, spc = 0 }   -- glitch Pokemon
+    end
+    local base = BaseStats + (dex - 1) * BASE_DATA_SIZE
+    local function b(i) return emu.memory.cart0:read8(base + i) end
+    local dv = splitDVs(dvs)
+    return {
+        hp  = calcStat(b(1), dv.hp,  statExp.hp,  level, true),
+        atk = calcStat(b(2), dv.atk, statExp.atk, level),
+        def = calcStat(b(3), dv.def, statExp.def, level),
+        spe = calcStat(b(4), dv.spe, statExp.spe, level),
+        spc = calcStat(b(5), dv.spc, statExp.spc, level),
+    }
+end
+
+-- Parse one box (BOX_SIZE bytes, same layout in WRAM and SRAM) into a list of
+-- Pokemon tables. Returns nil if the data isn't a valid box.
+local BOX_MONS_OFS  = wBoxMons - wBoxDataStart
+local BOX_OT_OFS    = wBoxMonOT - wBoxDataStart
+local BOX_NICKS_OFS = wBoxMonNicks - wBoxDataStart
+local function parseBox(data)
+    local function u8(o) return data:byte(o + 1) end
+    local function u16(o) return (u8(o) << 8) | u8(o + 1) end
+    local function name(base, i) return decode(data:sub(base + i * NAME_LENGTH + 1, base + (i + 1) * NAME_LENGTH)) end
+
+    local count = u8(0)   -- wBoxCount
+    if count > MONS_PER_BOX then return nil end
+    local mons = {}
+    for i = 0, count - 1 do
+        local a = BOX_MONS_OFS + i * BOX_MON_SIZE      -- box_struct (macros/ram.asm)
+        local species, level, dvs = u8(a), u8(a + 3), u16(a + 27)
+        local statExp = { hp = u16(a + 17), atk = u16(a + 19), def = u16(a + 21),
+                          spe = u16(a + 23), spc = u16(a + 25) }
+        local stats = calcStats(species, level, dvs, statExp)
+        local mon = buildMon({
+            species = species, hp = u16(a + 1), maxHP = stats.hp, level = level,
+            status = u8(a + 4), type1 = u8(a + 5), type2 = u8(a + 6),
+            atk = stats.atk, def = stats.def, spe = stats.spe, spc = stats.spc,
+            dvs = dvs, statExp = statExp,
+            moves = { u8(a + 8), u8(a + 9), u8(a + 10), u8(a + 11) },
+            pp    = { u8(a + 29), u8(a + 30), u8(a + 31), u8(a + 32) },
+        })
+        mon.nickname = name(BOX_NICKS_OFS, i)
+        mon.otName   = name(BOX_OT_OFS, i)
+        mon.otID     = u16(a + 12)
+        mon.exp      = (u8(a + 14) << 16) | (u8(a + 15) << 8) | u8(a + 16)
+        mons[#mons + 1] = mon
+    end
+    return mons
 end
 
 -- A party Pokemon's nickname (party slot 0-5)
@@ -844,22 +987,60 @@ local function getTeam()
     return { count = count, mons = mons }
 end
 
--- Returns nil while the game is still loading. Item price is nil if it can't be sold.
-local function getBag()
-    local count = emu:read8(wNumBagItems)
-    if count > 20 then return nil end
+-- An item list ({item ID, quantity} pairs, 0xFF-terminated) - the Bag and the PC use the
+-- same format. Returns nil while the game is still loading. Item price is nil if it can't be sold.
+local function readItemList(countAddr, listAddr, capacity)
+    local count = emu:read8(countAddr)
+    if count > capacity then return nil end
     local items = {}
     for i = 0, count - 1 do
-        local id = emu:read8(wBagItems + i * 2)
+        local id = emu:read8(listAddr + i * 2)
         if id == 0xFF then break end
         items[#items + 1] = {
             id    = id,
             name  = itemName(id),
-            qty   = emu:read8(wBagItems + i * 2 + 1),
+            qty   = emu:read8(listAddr + i * 2 + 1),
             price = sellPrice(id),
         }
     end
-    return { count = count, items = items }
+    return { count = count, capacity = capacity, items = items }
+end
+
+local function getBag()
+    return readItemList(wNumBagItems, wBagItems, BAG_ITEM_CAPACITY)
+end
+
+local function getPCItems()
+    return readItemList(wNumBoxItems, wBoxItems, PC_ITEM_CAPACITY)
+end
+
+-- All 12 PC boxes. The current box is read from WRAM (live); the others from SRAM.
+-- A box with unreadable = true couldn't be read (no SRAM access, or invalid data there) -
+-- its contents are unknown, as opposed to an empty box.
+local function getPCBoxes()
+    local boxNum = emu:read8(wCurrentBoxNum)
+    local current = (boxNum & 0x7F) + 1
+    -- Until the player first switches boxes, the SRAM boxes aren't set up yet (they're empty)
+    local savedBoxesUsed = boxNum & 0x80 ~= 0
+
+    local boxes = {}
+    for n = 1, NUM_BOXES do
+        local box = { number = n, current = n == current, mons = {} }
+        if n == current then
+            box.mons = parseBox(emu:readRange(wBoxDataStart, BOX_SIZE)) or {}
+        elseif savedBoxesUsed then
+            local data = readSRAM(sBoxOffset(n), BOX_SIZE)
+            local mons = data and parseBox(data)
+            if mons then
+                box.mons = mons
+            else
+                box.unreadable = true   -- no SRAM access, or the bytes there aren't a valid box
+            end
+        end
+        box.count = #box.mons
+        boxes[n] = box
+    end
+    return { currentBox = current, boxes = boxes }
 end
 
 -- entries[dex].status is "owned", "seen" or "unseen"; name is nil when unseen
@@ -1037,13 +1218,51 @@ local function renderTeam(buf, team)
     end
 end
 
-local function renderBag(buf, bag)
-    if not bag then return end
-    buf:print(string.format("Bag (%d/20)\n\n", bag.count))
+-- Shared by the Bag and PC Items tabs
+local function renderItemList(buf, title, list)
+    if not list then return end
+    buf:print(string.format("%s (%d/%d)\n\n", title, list.count, list.capacity))
     buf:print(string.format("  %-12s %4s  %s\n", "Item", "Qty", "Sells for"))
-    for _, it in ipairs(bag.items) do
+    if #list.items == 0 then
+        buf:print("  (empty)\n")
+    end
+    for _, it in ipairs(list.items) do
         buf:print(string.format("  %-12s x%3d  %s\n",
             it.name, it.qty, it.price and string.format("¥%d", it.price) or "invaluable"))
+    end
+end
+
+local function renderBag(buf, bag) renderItemList(buf, "Bag", bag) end
+local function renderPCItems(buf, items) renderItemList(buf, "PC items", items) end
+
+-- 3 lines per Pokemon: summary, stats + DVs, moves (Stat Exp/OT/Exp are in the JSON)
+local function renderPCBoxes(buf, pc)
+    local total = 0
+    for _, box in ipairs(pc.boxes) do total = total + box.count end
+    buf:print(string.format("PC: %d Pokemon stored   (current box: %d)\n", total, pc.currentBox))
+
+    for _, box in ipairs(pc.boxes) do
+        local tag = box.current and "   <- current box" or ""
+        if box.unreadable then
+            buf:print(string.format("\nBox %d: (can't read this box from save RAM)%s\n", box.number, tag))
+        elseif box.count == 0 then
+            buf:print(string.format("\nBox %d: empty%s\n", box.number, tag))
+        else
+            buf:print(string.format("\nBox %d (%d/%d)%s\n", box.number, box.count, MONS_PER_BOX, tag))
+        end
+        for i, mon in ipairs(box.mons) do
+            buf:print(string.format("  %2d. %-22s Lv %-3d HP %3d/%-3d %-3s  %s\n",
+                i, displayName(mon), mon.level, mon.hp, mon.maxHP, mon.condition,
+                table.concat(mon.types, "/")))
+            local dv = mon.dv
+            buf:print(string.format("      Atk %3d  Def %3d  Spe %3d  Spc %3d    DVs HP %2d Atk %2d Def %2d Spe %2d Spc %2d\n",
+                mon.atk, mon.def, mon.spe, mon.spc, dv.hp, dv.atk, dv.def, dv.spe, dv.spc))
+            local moves = {}
+            for _, mv in ipairs(mon.moves) do
+                moves[#moves + 1] = string.format("%s %d/%d", mv.name, mv.pp, mv.maxPP)
+            end
+            buf:print("      " .. table.concat(moves, ", ") .. "\n")
+        end
     end
 end
 
@@ -1143,6 +1362,170 @@ local function renderBattle(buf, b)
 end
 
 ---------------------------------------------------------------------------
+-- JSON encoder (mGBA has none built in)
+---------------------------------------------------------------------------
+
+-- Lua has one table type; JSON has arrays and objects. A table whose keys are
+-- exactly 1..n is an array, anything else an object. An empty table becomes []
+-- (every empty table in `state` is a list: an empty bag, no grass encounters...).
+-- nil fields simply don't appear in the output.
+local function isArray(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n == #t
+end
+
+local JSON_ESCAPES = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+local function jsonString(s)
+    -- %c = control characters; names are already UTF-8 so everything else passes through
+    return '"' .. (s:gsub('[%c"\\]', function(c)
+        return JSON_ESCAPES[c] or string.format("\\u%04x", c:byte())
+    end)) .. '"'
+end
+
+local function encodeValue(v, out)
+    local t = type(v)
+    if t == "table" then
+        if isArray(v) then
+            out[#out + 1] = "["
+            for i = 1, #v do
+                if i > 1 then out[#out + 1] = "," end
+                encodeValue(v[i], out)
+            end
+            out[#out + 1] = "]"
+        else
+            -- Sorted keys: same data -> same text, so saved fixtures diff cleanly
+            local keys = {}
+            for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+            table.sort(keys)
+            out[#out + 1] = "{"
+            for i, k in ipairs(keys) do
+                if i > 1 then out[#out + 1] = "," end
+                local val = v[k]
+                if val == nil then val = v[tonumber(k)] end   -- non-string key
+                out[#out + 1] = jsonString(k)
+                out[#out + 1] = ":"
+                encodeValue(val, out)
+            end
+            out[#out + 1] = "}"
+        end
+    elseif t == "string" then
+        out[#out + 1] = jsonString(v)
+    elseif t == "number" then
+        if math.type(v) == "integer" then
+            out[#out + 1] = tostring(v)
+        elseif v ~= v or v == math.huge or v == -math.huge then
+            out[#out + 1] = "null"                       -- JSON has no NaN/inf
+        else
+            out[#out + 1] = string.format("%.14g", v)
+        end
+    elseif t == "boolean" then
+        out[#out + 1] = tostring(v)
+    else
+        out[#out + 1] = "null"
+    end
+end
+
+local function jsonEncode(v)
+    local out = {}
+    encodeValue(v, out)
+    return table.concat(out)
+end
+
+---------------------------------------------------------------------------
+-- TCP server: every update, each connected client gets the whole `state` as
+-- one line of JSON (newline-delimited JSON). Clients don't need to send anything.
+---------------------------------------------------------------------------
+
+local server
+local clients = {}     -- id -> { sock = socket, pending = unsent part of the current message }
+local nextClientID = 1
+
+local function dropClient(id, reason)
+    local c = clients[id]
+    if not c then return end
+    clients[id] = nil
+    c.sock:close()
+    console:log(string.format("[server] client %d disconnected%s", id, reason and (": " .. tostring(reason)) or ""))
+end
+
+-- Send as much of the pending message as the socket accepts right now. A slow
+-- client keeps its unsent remainder and simply skips updates until it catches up.
+local function flushClient(id)
+    local c = clients[id]
+    if not c or c.pending == "" then return end
+    local sent, err = c.sock:send(c.pending)
+    if type(sent) == "number" and sent >= 0 then
+        c.pending = c.pending:sub(sent + 1)
+    elseif err ~= socket.ERRORS.AGAIN then
+        dropClient(id, err)
+    end
+end
+
+-- We don't expect input, but read whatever arrives so it doesn't pile up,
+-- and notice when the client goes away.
+local function onClientData(id)
+    local c = clients[id]
+    if not c then return end
+    while true do
+        local data, err = c.sock:receive(1024)
+        if not data then
+            if err ~= socket.ERRORS.AGAIN then dropClient(id, err) end
+            return
+        end
+    end
+end
+
+local function onAccept()
+    local sock, err = server:accept()
+    if not sock then
+        console:error("[server] accept failed: " .. tostring(err))
+        return
+    end
+    local id = nextClientID
+    nextClientID = id + 1
+    clients[id] = { sock = sock, pending = "" }
+    sock:add("received", function() onClientData(id) end)
+    sock:add("error", function() dropClient(id, "socket error") end)
+    console:log(string.format("[server] client %d connected", id))
+end
+
+local function startServer()
+    for port = SERVER_PORT, SERVER_PORT + 9 do
+        local s, err = socket.bind("127.0.0.1", port)
+        if s then
+            local ok, listenErr = s:listen()
+            if listenErr then
+                s:close()
+                console:error("[server] listen failed: " .. tostring(listenErr))
+                return
+            end
+            server = s
+            server:add("received", onAccept)
+            console:log(string.format("[server] listening on 127.0.0.1:%d", port))
+            return
+        elseif err ~= socket.ERRORS.ADDRESS_IN_USE then
+            console:error("[server] bind failed: " .. tostring(err))
+            return
+        end
+    end
+    console:error(string.format("[server] ports %d-%d are all in use", SERVER_PORT, SERVER_PORT + 9))
+end
+
+-- Message format: {"protocol":1,"game":"yellow","frame":N,"state":{...}}\n
+-- Bump `protocol` when the shape of `state` changes in a way the GUI must know about.
+local function broadcast(state, frame)
+    if next(clients) == nil then return end     -- nobody listening: skip the encoding work
+    local message = jsonEncode({ protocol = 1, game = "yellow", frame = frame, state = state }) .. "\n"
+    for id, c in pairs(clients) do
+        if c.pending == "" then c.pending = message end
+        flushClient(id)
+    end
+end
+
+startServer()
+
+---------------------------------------------------------------------------
 -- Main loop
 ---------------------------------------------------------------------------
 
@@ -1155,6 +1538,16 @@ local TABS = {
       snapshot = function() return emu:readRange(wPartyCount, PARTY_DATA_END - wPartyCount) end },
     { key = "bag",      buf = bufBag,      get = getBag,      render = renderBag,
       snapshot = function() return emu:readRange(wNumBagItems, 42) end },
+    { key = "pcItems",  buf = bufPCItems,  get = getPCItems,  render = renderPCItems,
+      snapshot = function() return emu:readRange(wNumBoxItems, 1 + PC_ITEM_CAPACITY * 2 + 1) end },
+    { key = "pcBoxes",  buf = bufPCBoxes,  get = getPCBoxes,  render = renderPCBoxes,
+      -- current box number + live box in WRAM + both SRAM box banks (2 and 3),
+      -- the latter only once the saved boxes are in use (see readSRAM)
+      snapshot = function()
+          local boxNum = emu:read8(wCurrentBoxNum)
+          local saved = boxNum & 0x80 ~= 0 and readSRAM(2 * 0x2000, 2 * 0x2000) or ""
+          return string.char(boxNum) .. emu:readRange(wBoxDataStart, BOX_SIZE) .. saved
+      end },
     { key = "pokedex",  buf = bufPokedex,  get = getPokedex,  render = renderPokedex,
       -- owned + seen flag arrays are back to back
       snapshot = function() return emu:readRange(wPokedexOwned, POKEDEX_BYTES * 2) end },
@@ -1193,5 +1586,6 @@ callbacks:add("frame", function()
         for _, tab in ipairs(TABS) do
             refresh(tab)
         end
+        broadcast(state, frames)
     end
 end)

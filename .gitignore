@@ -17,6 +17,18 @@ sprites/
 *.2bpp
 *.pic
 
+# Captured game state (contains your trainer name/ID). Keep the folder, not the files.
+fixtures/*
+!fixtures/README.md
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
 # Editor / OS clutter
 .vscode/
 .idea/

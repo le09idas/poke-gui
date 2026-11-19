@@ -15,6 +15,24 @@ while you play and shows live game info in the scripting window.
 
 Loading the script before or after the ROM both work.
 
+### Reading the data from another program
+
+The script also runs a small TCP server on `127.0.0.1:8765` (localhost only; if the port
+is busy it tries the next few and logs which one it used in the Console tab). Every 15
+frames it sends each connected client one line of JSON:
+
+```json
+{"protocol":1,"game":"yellow","frame":1234,"state":{"player":{...},"team":{...},"bag":{...},...}}
+```
+
+`state` has one key per tab (`player`, `team`, `bag`, `pcBoxes`, `pcItems`, `pokedex`,
+`location`, `wild`, `battle`). To check it's working:
+
+```
+python tools/peek_state.py          # summary of one message
+python tools/peek_state.py --raw    # the whole thing
+```
+
 ## Tabs
 
 | Tab | Shows |
@@ -22,6 +40,8 @@ Loading the script before or after the ROM both work.
 | Player | Name, trainer ID, rival, play time, money/coins, position, Pikachu happiness, options, Fly destinations, badges |
 | Team | Party summary plus moves/PP, stats, DVs, Stat Exp, experience and OT for each Pokémon |
 | Bag | Items, quantities and sell prices (or "invaluable" for key items/HMs) |
+| PC Boxes | All 12 boxes: each stored Pokémon's level, HP, status, type, stats, DVs and moves |
+| PC Items | Items stored in the PC, same format as the Bag |
 | Pokedex | Seen/owned counts and the full 151 list |
 | Location | Current map, position, and the map's items (visible/hidden, obtained or not) |
 | Wild | The wild Pokémon you're fighting and the map's grass encounter table |
@@ -43,9 +63,9 @@ numbers are big-endian, money/coins are BCD, and text uses its own character enc
 
 ## Roadmap
 
-- [ ] Split data reading from display (getters return tables, renderers print them)
-- [ ] JSON + small HTTP server on `127.0.0.1` using mGBA's `socket` API
-- [ ] Web dashboard (`web/`) that polls the script and renders the data
+- [x] Split data reading from display (getters return tables, renderers print them)
+- [x] Stream the data as newline-delimited JSON over TCP on `127.0.0.1:8765` (mGBA `socket` API)
+- [ ] Desktop GUI in Python + PySide6 that connects to the script and renders the data
 - [ ] Sprites: battle sprites from VRAM, then a ROM decompressor for all Pokémon/trainer sprites
 - [ ] Support for other games (Red/Blue, Gold/Silver/Crystal, Gen 3)
 
