@@ -7,6 +7,10 @@
 --   Wild     - the wild Pokemon you're fighting + this map's grass encounters
 --   Battle   - both sides' Pokemon during a battle: HP, fainted/status, stats, moves
 -- Addresses come from pret/pokeyellow's pokeyellow.sym (symbols branch).
+--
+-- Layout: addresses + lookup tables -> helpers -> get*() functions (read the game,
+-- return plain tables) -> render*() functions (print a table into a tab) -> TABS
+-- list + frame loop, which keeps the latest data for every tab in `state`.
 
 -- Tabs appear in the scripting window in the order they're created
 local bufPlayer   = console:createBuffer("Player")
@@ -539,40 +543,9 @@ local function dexNumber(id)
     return emu.memory.cart0:read8(PokedexOrder + id - 1)
 end
 
-local function update()
-    bufWild:clear()
-
-    local battle = emu:read8(wIsInBattle)
-    if battle == 1 then
-        local species = emu:read8(wEnemyMon + 0)
-        bufWild:print(string.format("WILD %s (#%03d)\n", speciesName(species), dexNumber(species)))
-        bufWild:print(string.format("  Lv %d   HP %d/%d\n",
-            emu:read8(0xCFF2),          -- wEnemyMonLevel
-            read16BE(0xCFE5),           -- wEnemyMonHP
-            read16BE(0xCFF3)))          -- wEnemyMonMaxHP
-        bufWild:print(string.format("  Atk %d  Def %d  Spe %d  Spc %d\n",
-            read16BE(0xCFF5), read16BE(0xCFF7), read16BE(0xCFF9), read16BE(0xCFFB)))
-        local dvs = read16BE(0xCFF0)    -- wEnemyMonDVs (IVs)
-        bufWild:print(string.format("  DVs  Atk %d  Def %d  Spe %d  Spc %d\n\n",
-            (dvs >> 12) & 0xF, (dvs >> 8) & 0xF, (dvs >> 4) & 0xF, dvs & 0xF))
-    elseif battle == 2 then
-        bufWild:print("Trainer battle\n\n")
-    else
-        bufWild:print("Not in battle\n\n")
-    end
-
-    local rate = emu:read8(wGrassRate)
-    if rate == 0 then
-        bufWild:print("No grass encounters on this map\n")
-    else
-        bufWild:print(string.format("Grass encounters (rate %d/255 per step):\n", rate))
-        for i = 0, 9 do
-            local level   = emu:read8(wGrassMons + i * 2)
-            local species = emu:read8(wGrassMons + i * 2 + 1)
-            bufWild:print(string.format("  slot %d: Lv%2d %s\n", i + 1, level, speciesName(species)))
-        end
-    end
-end
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
 
 -- Read a BCD number: each byte holds two decimal digits (0x31 -> 31)
 local function readBCD(addr, length)
@@ -584,67 +557,22 @@ local function readBCD(addr, length)
     return value
 end
 
--- Defined here (above updatePlayer) because a local function can only be
--- used by code written after it
-local function mapName(id)
-    return MAP_NAMES[id] or string.format("Unknown map (0x%02X)", id)
+-- BCD read from the ROM (emu:read8 only sees whichever ROM bank is switched in)
+local function romBCD(addr, length)
+    local value = 0
+    for i = 0, length - 1 do
+        local b = emu.memory.cart0:read8(addr + i)
+        value = value * 100 + (b >> 4) * 10 + (b & 0xF)
+    end
+    return value
 end
 
-local function updatePlayer()
-    bufPlayer:clear()
+local function read24BE(addr)
+    return (emu:read8(addr) << 16) | (emu:read8(addr + 1) << 8) | emu:read8(addr + 2)
+end
 
-    local name  = decode(emu:readRange(wPlayerName, 11))
-    local rival = decode(emu:readRange(wRivalName, 11))
-    bufPlayer:print(string.format("Name:  %s   (ID %05d)\n", name, read16BE(wPlayerID)))
-    bufPlayer:print(string.format("Rival: %s\n", rival))
-
-    local maxed = emu:read8(wPlayTimeMaxed) ~= 0
-    bufPlayer:print(string.format("Play time: %d:%02d:%02d%s\n",
-        emu:read8(wPlayTimeHours), emu:read8(wPlayTimeMinutes), emu:read8(wPlayTimeSeconds),
-        maxed and "  (maxed out)" or ""))
-
-    local playerMoney = readBCD(wPlayerMoney, 3)
-    bufPlayer:print(string.format("Money: ¥%d   Coins: %d\n", playerMoney, readBCD(wPlayerCoins, 2)))
-
-    bufPlayer:print(string.format("Position: %s (X %d, Y %d)\n",
-        mapName(emu:read8(wCurMap)), emu:read8(wXCoord), emu:read8(wYCoord)))
-
-    bufPlayer:print(string.format("Pikachu happiness: %d/255  (mood %d)\n",
-        emu:read8(wPikachuHappiness), emu:read8(wPikachuMood)))
-
-    -- Options byte (constants/ram_constants.asm)
-    local opt = emu:read8(wOptions)
-    local textSpeed = ({ [1] = "Fast", [3] = "Medium", [5] = "Slow" })[opt & 0x0F] or "?"
-    local sound = ({ [0] = "Mono", "Earphone1", "Earphone2", "Earphone3" })[(opt >> 4) & 3]
-    bufPlayer:print(string.format("Options: Text %s, Animations %s, Style %s, Sound %s\n",
-        textSpeed,
-        (opt >> 7) & 1 == 1 and "Off" or "On",
-        (opt >> 6) & 1 == 1 and "Set" or "Shift",
-        sound))
-
-    -- Towns visited = Fly destinations (one bit per town map ID 0x00-0x0A)
-    local visited = {}
-    for town = 0, 10 do
-        if (emu:read8(wTownVisitedFlag + (town >> 3)) >> (town & 7)) & 1 == 1 then
-            visited[#visited + 1] = MAP_NAMES[town]
-        end
-    end
-    bufPlayer:print(string.format("Fly destinations (%d/11): %s\n\n",
-        #visited, #visited > 0 and table.concat(visited, ", ") or "none"))
-
-    -- Check each bit of the badge byte: (flags >> bit) & 1 is 1 if that badge is owned
-    local flags = emu:read8(wObtainedBadges)
-    local count = 0
-    local lines = {}
-    for bit = 0, 7 do
-        local earned = (flags >> bit) & 1 == 1
-        if earned then count = count + 1 end
-        lines[#lines + 1] = string.format("  [%s] %s Badge\n", earned and "X" or " ", BADGE_NAMES[bit])
-    end
-    bufPlayer:print(string.format("Badges: %d/8\n", count))
-    for _, line in ipairs(lines) do
-        bufPlayer:print(line)
-    end
+local function mapName(id)
+    return MAP_NAMES[id] or string.format("Unknown map (0x%02X)", id)
 end
 
 -- Test bit `index` in a flag array starting at `base` (8 flags per byte, lowest bit first)
@@ -669,6 +597,77 @@ local function itemName(id)
     return name
 end
 
+-- Move ID -> name, read from the ROM's MoveNames list (same layout as ItemNames)
+local moveNameCache = {}
+local function moveName(id)
+    if moveNameCache[id] then return moveNameCache[id] end
+    local addr = MoveNames
+    for _ = 1, id - 1 do
+        while emu.memory.cart0:read8(addr) ~= 0x50 do addr = addr + 1 end
+        addr = addr + 1
+    end
+    local name = decode(emu.memory.cart0:readRange(addr, 20))
+    moveNameCache[id] = name
+    return name
+end
+
+-- Same rules as the Poke Mart: key items and HMs can't be sold; everything
+-- else sells for half its price. Returns nil if it can't be sold.
+local function sellPrice(id)
+    if id >= 0xC4 and id < 0xC9 then return nil end          -- HMs
+    if id >= 0xC9 then                                       -- TMs: nybble table, in thousands
+        local t = id - 0xC9
+        local b = emu.memory.cart0:read8(TMPrices + (t >> 1))
+        local nybble = (t & 1 == 0) and (b >> 4) or (b & 0xF)
+        return nybble * 1000 // 2
+    end
+    local keyByte = emu.memory.cart0:read8(KeyItemFlags + ((id - 1) >> 3))
+    if (keyByte >> ((id - 1) & 7)) & 1 == 1 then return nil end   -- key item
+    return romBCD(ItemPrices + (id - 1) * 3, 3) // 2
+end
+
+-- Status byte: bits 0-2 = sleep turns, bit 3 = poison, 4 = burn, 5 = freeze, 6 = paralysis
+local function statusText(status, hp)
+    if hp == 0 then return "FNT" end
+    if status & 0x07 ~= 0 then return "SLP" end
+    if status & 0x08 ~= 0 then return "PSN" end
+    if status & 0x10 ~= 0 then return "BRN" end
+    if status & 0x20 ~= 0 then return "FRZ" end
+    if status & 0x40 ~= 0 then return "PAR" end
+    return "OK"
+end
+
+-- Type IDs -> list of names (one entry for single-type Pokemon)
+local function typeName(t)
+    return TYPE_NAMES[t] or string.format("?%02X", t)
+end
+local function typeNames(t1, t2)
+    if t1 == t2 then return { typeName(t1) } end
+    return { typeName(t1), typeName(t2) }
+end
+
+-- wIsInBattle -> "none" / "wild" / "trainer"
+local function battleKind()
+    local b = emu:read8(wIsInBattle)
+    if b == 1 then return "wild" end
+    if b == 2 then return "trainer" end
+    return "none"
+end
+
+-- Pokedex number -> internal species ID (the reverse of the ROM's PokedexOrder table).
+-- Built once, the first time it's needed.
+local dexToInternal
+local function internalFromDex(dex)
+    if not dexToInternal then
+        dexToInternal = {}
+        for id = 1, 190 do                     -- internal IDs go up to 190 (0xBE)
+            local n = dexNumber(id)
+            if n ~= 0 then dexToInternal[n] = id end   -- 0 = MissingNo. slots
+        end
+    end
+    return dexToInternal[dex]
+end
+
 -- Item balls on the current map, read live from the game's object data
 local function visibleItems()
     -- Which objects can be removed, and the flag that says whether they have been
@@ -687,6 +686,7 @@ local function visibleItems()
             local state = wSprite01StateData2 + (obj - 1) * 0x10
             local flag = toggleIndex[obj]
             list[#list + 1] = {
+                id = itemId,
                 name = itemName(itemId),
                 x = emu:read8(state + 5) - 4,
                 y = emu:read8(state + 4) - 4,
@@ -698,249 +698,13 @@ local function visibleItems()
     return list
 end
 
-local function updateLocation()
-    bufLocation:clear()
-
-    local map = emu:read8(wCurMap)
-    bufLocation:print(string.format("%s\n", mapName(map)))
-
-    -- Inside a building or dungeon, also show which town/route it belongs to
-    if map > LAST_OUTDOOR_MAP then
-        bufLocation:print(string.format("  (from %s)\n", mapName(emu:read8(wLastMap))))
-    end
-
-    bufLocation:print(string.format("  X %d, Y %d   [map 0x%02X]\n",
-        emu:read8(wXCoord), emu:read8(wYCoord), map))
-
-    -- Items: [name, visibility, item finder needed]
-    local items = {}
-    for _, it in ipairs(visibleItems()) do items[#items + 1] = it end
-    for _, h in ipairs(HIDDEN_ITEMS[map] or {}) do
-        items[#items + 1] = {
-            name = itemName(h.item), x = h.x, y = h.y, hidden = true,
-            obtained = testFlag(wObtainedHiddenItemsFlags, h.flag),
-        }
-    end
-
-    bufLocation:print("\nItems: [Item Name, Hidden?, ItemFinder] Obtained?\n")
-    if #items == 0 then
-        bufLocation:print("  (none on this map)\n")
-    end
-    for _, it in ipairs(items) do
-        bufLocation:print(string.format("  [%s, %s, %s]  %s  (X %d, Y %d)\n",
-            it.name,
-            it.hidden and "hidden" or "visible",
-            it.hidden and "yes" or "no",
-            it.obtained and "obtained" or "available",
-            it.x, it.y))
-    end
-end
-
--- Pokedex number -> internal species ID (the reverse of the ROM's PokedexOrder table).
--- Built once, the first time it's needed.
-local dexToInternal
-local function internalFromDex(dex)
-    if not dexToInternal then
-        dexToInternal = {}
-        for id = 1, 190 do                     -- internal IDs go up to 190 (0xBE)
-            local n = dexNumber(id)
-            if n ~= 0 then dexToInternal[n] = id end   -- 0 = MissingNo. slots
-        end
-    end
-    return dexToInternal[dex]
-end
-
--- Snapshot of both flag arrays, so the list is only redrawn when something changes.
--- (Redrawing a 151-line list 4 times a second would keep resetting the scroll position.)
-local lastDexSnapshot
-local function updatePokedex()
-    local snapshot = emu:readRange(wPokedexOwned, POKEDEX_BYTES * 2)  -- owned + seen are back to back
-    if snapshot == lastDexSnapshot then return end
-    lastDexSnapshot = snapshot
-
-    local seenCount, ownedCount = 0, 0
-    local lines = {}
-    for dex = 1, NUM_POKEMON do
-        local owned = testFlag(wPokedexOwned, dex - 1)
-        local seen  = testFlag(wPokedexSeen, dex - 1)
-        if seen then seenCount = seenCount + 1 end
-        if owned then ownedCount = ownedCount + 1 end
-
-        local name, status
-        if owned then
-            name, status = speciesName(internalFromDex(dex)), "owned"
-        elseif seen then
-            name, status = speciesName(internalFromDex(dex)), "seen"
-        else
-            name, status = "----------", ""          -- same as the in-game Pokedex
-        end
-        lines[#lines + 1] = string.format("  #%03d %-10s %s\n", dex, name, status)
-    end
-
-    bufPokedex:clear()
-    bufPokedex:print(string.format("Seen:  %3d / %d\n", seenCount, NUM_POKEMON))
-    bufPokedex:print(string.format("Owned: %3d / %d\n\n", ownedCount, NUM_POKEMON))
-    for _, line in ipairs(lines) do
-        bufPokedex:print(line)
-    end
-end
-
 ---------------------------------------------------------------------------
--- Team
+-- Pokemon structs (party_struct / battle_struct, macros/ram.asm)
 ---------------------------------------------------------------------------
 
--- Move ID -> name, read from the ROM's MoveNames list (same layout as ItemNames)
-local moveNameCache = {}
-local function moveName(id)
-    if moveNameCache[id] then return moveNameCache[id] end
-    local addr = MoveNames
-    for _ = 1, id - 1 do
-        while emu.memory.cart0:read8(addr) ~= 0x50 do addr = addr + 1 end
-        addr = addr + 1
-    end
-    local name = decode(emu.memory.cart0:readRange(addr, 20))
-    moveNameCache[id] = name
-    return name
-end
-
--- Status byte: bits 0-2 = sleep turns, bit 3 = poison, 4 = burn, 5 = freeze, 6 = paralysis
-local function statusText(status, hp)
-    if hp == 0 then return "FNT" end
-    if status & 0x07 ~= 0 then return "SLP" end
-    if status & 0x08 ~= 0 then return "PSN" end
-    if status & 0x10 ~= 0 then return "BRN" end
-    if status & 0x20 ~= 0 then return "FRZ" end
-    if status & 0x40 ~= 0 then return "PAR" end
-    return "OK"
-end
-
-local function typeText(t1, t2)
-    local a = TYPE_NAMES[t1] or string.format("?%02X", t1)
-    if t1 == t2 then return a end
-    return a .. "/" .. (TYPE_NAMES[t2] or string.format("?%02X", t2))
-end
-
-local function read24BE(addr)
-    return (emu:read8(addr) << 16) | (emu:read8(addr + 1) << 8) | emu:read8(addr + 2)
-end
-
-local lastTeamSnapshot
-local function updateTeam()
-    -- Only redraw when the party data changes (keeps your scroll position)
-    local snapshot = emu:readRange(wPartyCount, PARTY_DATA_END - wPartyCount)
-    if snapshot == lastTeamSnapshot then return end
-    lastTeamSnapshot = snapshot
-
-    bufTeam:clear()
-    local count = emu:read8(wPartyCount)
-    if count > 6 then return end               -- garbage while the game is still loading
-    bufTeam:print(string.format("Team (%d/6)\n", count))
-
-    for i = 0, count - 1 do
-        local a = wPartyMons + i * PARTY_MON_SIZE
-        local species  = speciesName(emu:read8(a))
-        local nickname = decode(emu:readRange(wPartyMonNicks + i * NAME_LENGTH, NAME_LENGTH))
-        local hp, maxHP = read16BE(a + 1), read16BE(a + 34)
-
-        -- Summary line: show the nickname only if it differs from the species name
-        local title = species
-        if nickname ~= species then title = nickname .. " (" .. species .. ")" end
-        bufTeam:print(string.format("\n%d. %s  Lv %d  HP %d/%d  %s\n",
-            i + 1, title, emu:read8(a + 33), hp, maxHP, statusText(emu:read8(a + 4), hp)))
-
-        -- Details
-        bufTeam:print(string.format("   Type:  %s\n", typeText(emu:read8(a + 5), emu:read8(a + 6))))
-
-        for m = 0, 3 do
-            local move = emu:read8(a + 8 + m)
-            if move ~= 0 then
-                local ppByte = emu:read8(a + 29 + m)
-                local ppUps  = ppByte >> 6             -- top 2 bits: PP Ups used
-                local basePP = emu.memory.cart0:read8(Moves + (move - 1) * 6 + 5)
-                local maxPP  = basePP + (basePP // 5) * ppUps
-                bufTeam:print(string.format("   %s %-12s PP %2d/%2d\n",
-                    m == 0 and "Moves:" or "      ", moveName(move), ppByte & 0x3F, maxPP))
-            end
-        end
-
-        bufTeam:print(string.format("   Stats: Atk %d  Def %d  Spe %d  Spc %d\n",
-            read16BE(a + 36), read16BE(a + 38), read16BE(a + 40), read16BE(a + 42)))
-
-        -- DVs (Gen 1 IVs, 0-15). The HP DV is built from the lowest bit of the other four.
-        local dvs = read16BE(a + 27)
-        local atk, def, spe, spc = (dvs >> 12) & 0xF, (dvs >> 8) & 0xF, (dvs >> 4) & 0xF, dvs & 0xF
-        local hpDV = ((atk & 1) << 3) | ((def & 1) << 2) | ((spe & 1) << 1) | (spc & 1)
-        bufTeam:print(string.format("   DVs:   HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
-            hpDV, atk, def, spe, spc))
-
-        -- Stat Exp (Gen 1 EVs, 0-65535 each)
-        bufTeam:print(string.format("   StatXP: HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
-            read16BE(a + 17), read16BE(a + 19), read16BE(a + 21), read16BE(a + 23), read16BE(a + 25)))
-
-        local ot = decode(emu:readRange(wPartyMonOT + i * NAME_LENGTH, NAME_LENGTH))
-        bufTeam:print(string.format("   Exp: %d   OT: %s (ID %05d)\n",
-            read24BE(a + 14), ot, read16BE(a + 12)))
-    end
-end
-
----------------------------------------------------------------------------
--- Bag
----------------------------------------------------------------------------
-
--- BCD read from the ROM (emu:read8 only sees whichever ROM bank is switched in)
-local function romBCD(addr, length)
-    local value = 0
-    for i = 0, length - 1 do
-        local b = emu.memory.cart0:read8(addr + i)
-        value = value * 100 + (b >> 4) * 10 + (b & 0xF)
-    end
-    return value
-end
-
--- Same rules as the Poke Mart: key items and HMs can't be sold; everything
--- else sells for half its price. Returns nil if it can't be sold.
-local function sellPrice(id)
-    if id >= 0xC4 and id < 0xC9 then return nil end          -- HMs
-    if id >= 0xC9 then                                       -- TMs: nybble table, in thousands
-        local t = id - 0xC9
-        local b = emu.memory.cart0:read8(TMPrices + (t >> 1))
-        local nybble = (t & 1 == 0) and (b >> 4) or (b & 0xF)
-        return nybble * 1000 // 2
-    end
-    local keyByte = emu.memory.cart0:read8(KeyItemFlags + ((id - 1) >> 3))
-    if (keyByte >> ((id - 1) & 7)) & 1 == 1 then return nil end   -- key item
-    return romBCD(ItemPrices + (id - 1) * 3, 3) // 2
-end
-
-local lastBagSnapshot
-local function updateBag()
-    local snapshot = emu:readRange(wNumBagItems, 42)
-    if snapshot == lastBagSnapshot then return end
-    lastBagSnapshot = snapshot
-
-    bufBag:clear()
-    local count = emu:read8(wNumBagItems)
-    if count > 20 then return end
-    bufBag:print(string.format("Bag (%d/20)\n\n", count))
-    bufBag:print(string.format("  %-12s %4s  %s\n", "Item", "Qty", "Sells for"))
-
-    for i = 0, count - 1 do
-        local id  = emu:read8(wBagItems + i * 2)
-        local qty = emu:read8(wBagItems + i * 2 + 1)
-        if id == 0xFF then break end
-        local price = sellPrice(id)
-        bufBag:print(string.format("  %-12s x%3d  %s\n",
-            itemName(id), qty, price and string.format("¥%d", price) or "invaluable"))
-    end
-end
-
----------------------------------------------------------------------------
--- Battle
----------------------------------------------------------------------------
-
--- During battle the active Pokemon on each side live in a separate "battle_struct"
--- (macros/ram.asm). Its HP/PP/stats are the live values; the party copy only
--- catches up when the Pokemon switches out or the battle ends.
+-- During battle the active Pokemon on each side live in a separate "battle_struct".
+-- Its HP/PP/stats are the live values; the party copy only catches up when the
+-- Pokemon switches out or the battle ends.
 local wBattleMon       = 0xD013  -- player's active Pokemon (battle_struct)
 local wPlayerMonNumber = 0xCC2F  -- which party slot (0-5) is the player's active Pokemon
 local wEnemyMonBattle  = 0xCFE4  -- enemy's active Pokemon (battle_struct) = wEnemyMon
@@ -959,28 +723,38 @@ local STAT_EXP_OFS = 17  -- party_struct only: 5 x 2-byte Stat Exp (HP, Atk, Def
 -- statExpAddr: a party_struct to take Stat Exp from, since battle_struct has none.
 --   nil = no party data (wild Pokemon), shown as all zeros - which is what they really have.
 local function readMon(addr, ofs, statExpAddr)
+    -- DVs (Gen 1 IVs, 0-15). The HP DV is built from the lowest bit of the other four.
     local dvs = read16BE(addr + ofs.dvs)
     local atkDV, defDV, speDV, spcDV = (dvs >> 12) & 0xF, (dvs >> 8) & 0xF, (dvs >> 4) & 0xF, dvs & 0xF
-    local statExp = { 0, 0, 0, 0, 0 }
+
+    -- Stat Exp (Gen 1 EVs, 0-65535 each)
+    local se = { 0, 0, 0, 0, 0 }
     if statExpAddr then
-        for s = 1, 5 do statExp[s] = read16BE(statExpAddr + STAT_EXP_OFS + (s - 1) * 2) end
+        for s = 1, 5 do se[s] = read16BE(statExpAddr + STAT_EXP_OFS + (s - 1) * 2) end
     end
 
+    local species = emu:read8(addr)
+    local hp      = read16BE(addr + ofs.hp)
+    local status  = emu:read8(addr + ofs.status)
+    local type1, type2 = emu:read8(addr + ofs.type1), emu:read8(addr + ofs.type2)
+
     local mon = {
+        species   = species,                 -- internal ID
+        name      = speciesName(species),
+        dex       = dexNumber(species),
+        level     = emu:read8(addr + ofs.level),
+        hp        = hp,
+        maxHP     = read16BE(addr + ofs.maxHP),
+        status    = status,                  -- raw status byte
+        condition = statusText(status, hp),  -- "OK", "FNT", "SLP", ...
+        types     = typeNames(type1, type2),
+        atk = read16BE(addr + ofs.atk), def = read16BE(addr + ofs.def),
+        spe = read16BE(addr + ofs.spe), spc = read16BE(addr + ofs.spc),
         dv = {
             hp  = ((atkDV & 1) << 3) | ((defDV & 1) << 2) | ((speDV & 1) << 1) | (spcDV & 1),
             atk = atkDV, def = defDV, spe = speDV, spc = spcDV,
         },
-        statExp = statExp,
-        species = emu:read8(addr),
-        hp      = read16BE(addr + ofs.hp),
-        maxHP   = read16BE(addr + ofs.maxHP),
-        level   = emu:read8(addr + ofs.level),
-        status  = emu:read8(addr + ofs.status),
-        type1   = emu:read8(addr + ofs.type1),
-        type2   = emu:read8(addr + ofs.type2),
-        atk = read16BE(addr + ofs.atk), def = read16BE(addr + ofs.def),
-        spe = read16BE(addr + ofs.spe), spc = read16BE(addr + ofs.spc),
+        statExp = { hp = se[1], atk = se[2], def = se[3], spe = se[4], spc = se[5] },
         moves = {},
     }
     for m = 0, 3 do
@@ -989,103 +763,435 @@ local function readMon(addr, ofs, statExpAddr)
             local ppByte = emu:read8(addr + ofs.pp + m)
             local basePP = emu.memory.cart0:read8(Moves + (move - 1) * 6 + 5)
             mon.moves[#mon.moves + 1] = {
-                name = moveName(move),
-                pp = ppByte & 0x3F,
-                maxPP = basePP + (basePP // 5) * (ppByte >> 6),
+                id    = move,
+                name  = moveName(move),
+                pp    = ppByte & 0x3F,
+                maxPP = basePP + (basePP // 5) * (ppByte >> 6),   -- top 2 bits: PP Ups used
             }
         end
     end
     return mon
 end
 
-local function printBattleMon(slot, name, mon, active)
-    bufBattle:print(string.format("%s%d. %-22s Lv %-3d HP %3d/%-3d %s\n",
-        active and ">" or " ", slot, name, mon.level, mon.hp, mon.maxHP,
-        mon.hp == 0 and "FAINTED" or statusText(mon.status, mon.hp)))
-    bufBattle:print(string.format("     %s   Atk %d  Def %d  Spe %d  Spc %d\n",
-        typeText(mon.type1, mon.type2), mon.atk, mon.def, mon.spe, mon.spc))
-    bufBattle:print(string.format("     IVs (DVs):       HP %2d  Atk %2d  Def %2d  Spe %2d  Spc %2d\n",
-        mon.dv.hp, mon.dv.atk, mon.dv.def, mon.dv.spe, mon.dv.spc))
-    local se = mon.statExp
-    bufBattle:print(string.format("     EVs (Stat Exp):  HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
-        se[1], se[2], se[3], se[4], se[5]))
-    local moves = {}
-    for _, mv in ipairs(mon.moves) do
-        moves[#moves + 1] = string.format("%s %d/%d", mv.name, mv.pp, mv.maxPP)
-    end
-    bufBattle:print("     " .. table.concat(moves, ", ") .. "\n")
+-- A party Pokemon's nickname (party slot 0-5)
+local function partyNickname(i)
+    return decode(emu:readRange(wPartyMonNicks + i * NAME_LENGTH, NAME_LENGTH))
 end
 
-local lastBattleSnapshot
-local function updateBattle()
-    local battle = emu:read8(wIsInBattle)
+---------------------------------------------------------------------------
+-- Getters: read the game and return plain tables (numbers, strings, booleans,
+-- lists). No printing here - these tables are what the socket server will send.
+---------------------------------------------------------------------------
 
-    -- Redraw only when something relevant changes
-    local snapshot = string.char(battle)
-        .. emu:readRange(wBattleMon, 0x1D) .. emu:readRange(wEnemyMonBattle, 0x1D)
-        .. emu:readRange(wPartyCount, wPartyMonOT - wPartyCount)
-        .. emu:readRange(wEnemyPartyCount, 1 + 7 + 6 * PARTY_MON_SIZE)
-        .. string.char(emu:read8(wPlayerMonNumber))
-    if snapshot == lastBattleSnapshot then return end
-    lastBattleSnapshot = snapshot
+local function getPlayer()
+    local opt = emu:read8(wOptions)   -- constants/ram_constants.asm
+    local map = emu:read8(wCurMap)
 
-    bufBattle:clear()
-    if battle ~= 1 and battle ~= 2 then
-        bufBattle:print("Not in battle\n")
-        return
+    -- Towns visited = Fly destinations (one bit per town map ID 0x00-0x0A)
+    local fly = {}
+    for town = 0, 10 do
+        if testFlag(wTownVisitedFlag, town) then fly[#fly + 1] = MAP_NAMES[town] end
     end
 
+    -- One bit per badge (bit 0 = Boulder ... bit 7 = Earth)
+    local badgeFlags = emu:read8(wObtainedBadges)
+    local badges = {}
+    for bit = 0, 7 do
+        badges[#badges + 1] = { name = BADGE_NAMES[bit], earned = (badgeFlags >> bit) & 1 == 1 }
+    end
+
+    return {
+        name  = decode(emu:readRange(wPlayerName, NAME_LENGTH)),
+        rival = decode(emu:readRange(wRivalName, NAME_LENGTH)),
+        id    = read16BE(wPlayerID),
+        playTime = {
+            hours   = emu:read8(wPlayTimeHours),
+            minutes = emu:read8(wPlayTimeMinutes),
+            seconds = emu:read8(wPlayTimeSeconds),
+            maxed   = emu:read8(wPlayTimeMaxed) ~= 0,
+        },
+        money = readBCD(wPlayerMoney, 3),
+        coins = readBCD(wPlayerCoins, 2),
+        map   = { id = map, name = mapName(map) },
+        x     = emu:read8(wXCoord),
+        y     = emu:read8(wYCoord),
+        pikachu = { happiness = emu:read8(wPikachuHappiness), mood = emu:read8(wPikachuMood) },
+        options = {
+            textSpeed   = ({ [1] = "Fast", [3] = "Medium", [5] = "Slow" })[opt & 0x0F] or "?",
+            animations  = (opt >> 7) & 1 == 0,
+            battleStyle = (opt >> 6) & 1 == 1 and "Set" or "Shift",
+            sound       = ({ [0] = "Mono", "Earphone1", "Earphone2", "Earphone3" })[(opt >> 4) & 3],
+        },
+        flyDestinations = fly,
+        badges = badges,
+    }
+end
+
+-- Returns nil while the game is still loading (party count is garbage)
+local function getTeam()
+    local count = emu:read8(wPartyCount)
+    if count > 6 then return nil end
+    local mons = {}
+    for i = 0, count - 1 do
+        local a = wPartyMons + i * PARTY_MON_SIZE
+        local mon = readMon(a, PARTY_OFS, a)
+        mon.nickname = partyNickname(i)
+        mon.exp      = read24BE(a + 14)    -- party_struct Exp, 3 bytes
+        mon.otID     = read16BE(a + 12)    -- party_struct OTID
+        mon.otName   = decode(emu:readRange(wPartyMonOT + i * NAME_LENGTH, NAME_LENGTH))
+        mons[#mons + 1] = mon
+    end
+    return { count = count, mons = mons }
+end
+
+-- Returns nil while the game is still loading. Item price is nil if it can't be sold.
+local function getBag()
+    local count = emu:read8(wNumBagItems)
+    if count > 20 then return nil end
+    local items = {}
+    for i = 0, count - 1 do
+        local id = emu:read8(wBagItems + i * 2)
+        if id == 0xFF then break end
+        items[#items + 1] = {
+            id    = id,
+            name  = itemName(id),
+            qty   = emu:read8(wBagItems + i * 2 + 1),
+            price = sellPrice(id),
+        }
+    end
+    return { count = count, items = items }
+end
+
+-- entries[dex].status is "owned", "seen" or "unseen"; name is nil when unseen
+local function getPokedex()
+    local seen, owned, entries = 0, 0, {}
+    for dex = 1, NUM_POKEMON do
+        local isOwned = testFlag(wPokedexOwned, dex - 1)
+        local isSeen  = testFlag(wPokedexSeen, dex - 1)
+        if isSeen then seen = seen + 1 end
+        if isOwned then owned = owned + 1 end
+        local status = isOwned and "owned" or (isSeen and "seen" or "unseen")
+        entries[dex] = {
+            dex    = dex,
+            status = status,
+            name   = status ~= "unseen" and speciesName(internalFromDex(dex)) or nil,
+        }
+    end
+    return { seen = seen, owned = owned, total = NUM_POKEMON, entries = entries }
+end
+
+local function getLocation()
+    local map = emu:read8(wCurMap)
+    local loc = {
+        map   = { id = map, name = mapName(map) },
+        x     = emu:read8(wXCoord),
+        y     = emu:read8(wYCoord),
+        items = visibleItems(),
+    }
+    -- Inside a building or dungeon, also note which town/route it belongs to
+    if map > LAST_OUTDOOR_MAP then
+        local last = emu:read8(wLastMap)
+        loc.parentMap = { id = last, name = mapName(last) }
+    end
+    for _, h in ipairs(HIDDEN_ITEMS[map] or {}) do
+        loc.items[#loc.items + 1] = {
+            id = h.item, name = itemName(h.item), x = h.x, y = h.y, hidden = true,
+            obtained = testFlag(wObtainedHiddenItemsFlags, h.flag),
+        }
+    end
+    return loc
+end
+
+-- grassRate 0 = no grass encounters on this map (grass is then empty)
+local function getWild()
+    local wild = { battle = battleKind(), grassRate = emu:read8(wGrassRate), grass = {} }
+    if wild.battle == "wild" then
+        wild.enemy = readMon(wEnemyMon, BATTLE_OFS)
+    end
+    if wild.grassRate ~= 0 then
+        for i = 0, 9 do
+            local species = emu:read8(wGrassMons + i * 2 + 1)
+            wild.grass[#wild.grass + 1] = {
+                slot    = i + 1,
+                level   = emu:read8(wGrassMons + i * 2),
+                species = species,
+                name    = speciesName(species),
+                dex     = dexNumber(species),
+            }
+        end
+    end
+    return wild
+end
+
+-- Both sides of the current battle. The active Pokemon on each side is marked
+-- active = true and read from its battle_struct (live values).
+local function getBattle()
+    local kind = battleKind()
+    local b = { battle = kind }
+    if kind == "none" then return b end
+
     -- Opponent
-    if battle == 1 then
-        bufBattle:print("WILD POKEMON\n")
+    if kind == "wild" then
         local mon = readMon(wEnemyMonBattle, BATTLE_OFS)
-        printBattleMon(1, speciesName(mon.species), mon, true)
+        mon.active = true
+        b.opponent = { count = 1, mons = { mon } }
     else
-        local trainer = decode(emu:readRange(wTrainerName, 13))
         local count = emu:read8(wEnemyPartyCount)
         local activeSlot = emu:read8(wEnemyMonBattle + 3)   -- battle_struct PartyPos
-        bufBattle:print(string.format("OPPONENT: %s (%d Pokemon)\n", trainer, count))
+        local mons = {}
         for i = 0, math.min(count, 6) - 1 do
             local party = wEnemyMons + i * PARTY_MON_SIZE
             local mon
             if i == activeSlot then
-                mon = readMon(wEnemyMonBattle, BATTLE_OFS, party) -- live values
+                mon = readMon(wEnemyMonBattle, BATTLE_OFS, party)
             else
                 mon = readMon(party, PARTY_OFS, party)
             end
-            printBattleMon(i + 1, speciesName(mon.species), mon, i == activeSlot)
+            mon.active = i == activeSlot
+            mons[#mons + 1] = mon
         end
+        b.opponent = { trainer = decode(emu:readRange(wTrainerName, 13)), count = count, mons = mons }
     end
 
     -- Player's team
     local count = emu:read8(wPartyCount)
     local activeSlot = emu:read8(wPlayerMonNumber)
-    bufBattle:print(string.format("\nYOUR TEAM (%d Pokemon)\n", count))
+    local mons = {}
     for i = 0, math.min(count, 6) - 1 do
         local party = wPartyMons + i * PARTY_MON_SIZE
         local mon
         if i == activeSlot then
-            mon = readMon(wBattleMon, BATTLE_OFS, party)          -- live values
+            mon = readMon(wBattleMon, BATTLE_OFS, party)
         else
             mon = readMon(party, PARTY_OFS, party)
         end
-        local nickname = decode(emu:readRange(wPartyMonNicks + i * NAME_LENGTH, NAME_LENGTH))
-        local species  = speciesName(mon.species)
-        local name = nickname == species and species or (nickname .. " (" .. species .. ")")
-        printBattleMon(i + 1, name, mon, i == activeSlot)
+        mon.active = i == activeSlot
+        mon.nickname = partyNickname(i)
+        mons[#mons + 1] = mon
     end
+    b.player = { count = count, mons = mons }
+    return b
+end
+
+---------------------------------------------------------------------------
+-- Renderers: print a getter's table into a scripting-window buffer.
+-- No memory reads here. The buffer is already cleared.
+---------------------------------------------------------------------------
+
+-- "Sparky (Pikachu)", or just "Pikachu" if it has no nickname
+local function displayName(mon)
+    if not mon.nickname or mon.nickname == mon.name then return mon.name end
+    return mon.nickname .. " (" .. mon.name .. ")"
+end
+
+local function renderPlayer(buf, p)
+    buf:print(string.format("Name:  %s   (ID %05d)\n", p.name, p.id))
+    buf:print(string.format("Rival: %s\n", p.rival))
+
+    local t = p.playTime
+    buf:print(string.format("Play time: %d:%02d:%02d%s\n",
+        t.hours, t.minutes, t.seconds, t.maxed and "  (maxed out)" or ""))
+
+    buf:print(string.format("Money: ¥%d   Coins: %d\n", p.money, p.coins))
+    buf:print(string.format("Position: %s (X %d, Y %d)\n", p.map.name, p.x, p.y))
+    buf:print(string.format("Pikachu happiness: %d/255  (mood %d)\n",
+        p.pikachu.happiness, p.pikachu.mood))
+
+    local o = p.options
+    buf:print(string.format("Options: Text %s, Animations %s, Style %s, Sound %s\n",
+        o.textSpeed, o.animations and "On" or "Off", o.battleStyle, o.sound))
+
+    local fly = p.flyDestinations
+    buf:print(string.format("Fly destinations (%d/11): %s\n\n",
+        #fly, #fly > 0 and table.concat(fly, ", ") or "none"))
+
+    local count = 0
+    for _, badge in ipairs(p.badges) do
+        if badge.earned then count = count + 1 end
+    end
+    buf:print(string.format("Badges: %d/8\n", count))
+    for _, badge in ipairs(p.badges) do
+        buf:print(string.format("  [%s] %s Badge\n", badge.earned and "X" or " ", badge.name))
+    end
+end
+
+local function renderTeam(buf, team)
+    if not team then return end
+    buf:print(string.format("Team (%d/6)\n", team.count))
+    for i, mon in ipairs(team.mons) do
+        buf:print(string.format("\n%d. %s  Lv %d  HP %d/%d  %s\n",
+            i, displayName(mon), mon.level, mon.hp, mon.maxHP, mon.condition))
+        buf:print(string.format("   Type:  %s\n", table.concat(mon.types, "/")))
+        for m, mv in ipairs(mon.moves) do
+            buf:print(string.format("   %s %-12s PP %2d/%2d\n",
+                m == 1 and "Moves:" or "      ", mv.name, mv.pp, mv.maxPP))
+        end
+        buf:print(string.format("   Stats: Atk %d  Def %d  Spe %d  Spc %d\n",
+            mon.atk, mon.def, mon.spe, mon.spc))
+        local dv, se = mon.dv, mon.statExp
+        buf:print(string.format("   DVs:   HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
+            dv.hp, dv.atk, dv.def, dv.spe, dv.spc))
+        buf:print(string.format("   StatXP: HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
+            se.hp, se.atk, se.def, se.spe, se.spc))
+        buf:print(string.format("   Exp: %d   OT: %s (ID %05d)\n", mon.exp, mon.otName, mon.otID))
+    end
+end
+
+local function renderBag(buf, bag)
+    if not bag then return end
+    buf:print(string.format("Bag (%d/20)\n\n", bag.count))
+    buf:print(string.format("  %-12s %4s  %s\n", "Item", "Qty", "Sells for"))
+    for _, it in ipairs(bag.items) do
+        buf:print(string.format("  %-12s x%3d  %s\n",
+            it.name, it.qty, it.price and string.format("¥%d", it.price) or "invaluable"))
+    end
+end
+
+local function renderPokedex(buf, dex)
+    buf:print(string.format("Seen:  %3d / %d\n", dex.seen, dex.total))
+    buf:print(string.format("Owned: %3d / %d\n\n", dex.owned, dex.total))
+    for _, e in ipairs(dex.entries) do
+        -- Unseen entries look like the in-game Pokedex
+        buf:print(string.format("  #%03d %-10s %s\n",
+            e.dex, e.name or "----------", e.status ~= "unseen" and e.status or ""))
+    end
+end
+
+local function renderLocation(buf, loc)
+    buf:print(string.format("%s\n", loc.map.name))
+    if loc.parentMap then
+        buf:print(string.format("  (from %s)\n", loc.parentMap.name))
+    end
+    buf:print(string.format("  X %d, Y %d   [map 0x%02X]\n", loc.x, loc.y, loc.map.id))
+
+    -- Items: [name, visibility, item finder needed]
+    buf:print("\nItems: [Item Name, Hidden?, ItemFinder] Obtained?\n")
+    if #loc.items == 0 then
+        buf:print("  (none on this map)\n")
+    end
+    for _, it in ipairs(loc.items) do
+        buf:print(string.format("  [%s, %s, %s]  %s  (X %d, Y %d)\n",
+            it.name,
+            it.hidden and "hidden" or "visible",
+            it.hidden and "yes" or "no",
+            it.obtained and "obtained" or "available",
+            it.x, it.y))
+    end
+end
+
+local function renderWild(buf, wild)
+    if wild.battle == "wild" then
+        local e = wild.enemy
+        buf:print(string.format("WILD %s (#%03d)\n", e.name, e.dex))
+        buf:print(string.format("  Lv %d   HP %d/%d\n", e.level, e.hp, e.maxHP))
+        buf:print(string.format("  Atk %d  Def %d  Spe %d  Spc %d\n", e.atk, e.def, e.spe, e.spc))
+        buf:print(string.format("  DVs  Atk %d  Def %d  Spe %d  Spc %d\n\n",
+            e.dv.atk, e.dv.def, e.dv.spe, e.dv.spc))
+    elseif wild.battle == "trainer" then
+        buf:print("Trainer battle\n\n")
+    else
+        buf:print("Not in battle\n\n")
+    end
+
+    if wild.grassRate == 0 then
+        buf:print("No grass encounters on this map\n")
+    else
+        buf:print(string.format("Grass encounters (rate %d/255 per step):\n", wild.grassRate))
+        for _, g in ipairs(wild.grass) do
+            buf:print(string.format("  slot %d: Lv%2d %s\n", g.slot, g.level, g.name))
+        end
+    end
+end
+
+local function printBattleMon(buf, slot, mon)
+    buf:print(string.format("%s%d. %-22s Lv %-3d HP %3d/%-3d %s\n",
+        mon.active and ">" or " ", slot, displayName(mon), mon.level, mon.hp, mon.maxHP,
+        mon.condition == "FNT" and "FAINTED" or mon.condition))
+    buf:print(string.format("     %s   Atk %d  Def %d  Spe %d  Spc %d\n",
+        table.concat(mon.types, "/"), mon.atk, mon.def, mon.spe, mon.spc))
+    buf:print(string.format("     IVs (DVs):       HP %2d  Atk %2d  Def %2d  Spe %2d  Spc %2d\n",
+        mon.dv.hp, mon.dv.atk, mon.dv.def, mon.dv.spe, mon.dv.spc))
+    local se = mon.statExp
+    buf:print(string.format("     EVs (Stat Exp):  HP %d  Atk %d  Def %d  Spe %d  Spc %d\n",
+        se.hp, se.atk, se.def, se.spe, se.spc))
+    local moves = {}
+    for _, mv in ipairs(mon.moves) do
+        moves[#moves + 1] = string.format("%s %d/%d", mv.name, mv.pp, mv.maxPP)
+    end
+    buf:print("     " .. table.concat(moves, ", ") .. "\n")
+end
+
+local function renderBattle(buf, b)
+    if b.battle == "none" then
+        buf:print("Not in battle\n")
+        return
+    end
+
+    if b.battle == "wild" then
+        buf:print("WILD POKEMON\n")
+    else
+        buf:print(string.format("OPPONENT: %s (%d Pokemon)\n", b.opponent.trainer, b.opponent.count))
+    end
+    for i, mon in ipairs(b.opponent.mons) do
+        printBattleMon(buf, i, mon)
+    end
+
+    buf:print(string.format("\nYOUR TEAM (%d Pokemon)\n", b.player.count))
+    for i, mon in ipairs(b.player.mons) do
+        printBattleMon(buf, i, mon)
+    end
+end
+
+---------------------------------------------------------------------------
+-- Main loop
+---------------------------------------------------------------------------
+
+-- snapshot (optional): returns raw RAM bytes; the tab is only re-read and redrawn
+-- when they change. Redrawing a long list 4 times a second would keep resetting
+-- the scroll position. Tabs without one are redrawn every update.
+local TABS = {
+    { key = "player",   buf = bufPlayer,   get = getPlayer,   render = renderPlayer },
+    { key = "team",     buf = bufTeam,     get = getTeam,     render = renderTeam,
+      snapshot = function() return emu:readRange(wPartyCount, PARTY_DATA_END - wPartyCount) end },
+    { key = "bag",      buf = bufBag,      get = getBag,      render = renderBag,
+      snapshot = function() return emu:readRange(wNumBagItems, 42) end },
+    { key = "pokedex",  buf = bufPokedex,  get = getPokedex,  render = renderPokedex,
+      -- owned + seen flag arrays are back to back
+      snapshot = function() return emu:readRange(wPokedexOwned, POKEDEX_BYTES * 2) end },
+    { key = "location", buf = bufLocation, get = getLocation, render = renderLocation },
+    { key = "wild",     buf = bufWild,     get = getWild,     render = renderWild },
+    { key = "battle",   buf = bufBattle,   get = getBattle,   render = renderBattle,
+      snapshot = function()
+          return string.char(emu:read8(wIsInBattle))
+              .. emu:readRange(wBattleMon, 0x1D) .. emu:readRange(wEnemyMonBattle, 0x1D)
+              .. emu:readRange(wPartyCount, wPartyMonOT - wPartyCount)
+              .. emu:readRange(wEnemyPartyCount, 1 + 7 + 6 * PARTY_MON_SIZE)
+              .. string.char(emu:read8(wPlayerMonNumber))
+      end },
+}
+
+-- Latest data for every tab: state.player, state.team, state.bag, ...
+-- This is what the socket server will send to the GUI.
+local state = {}
+local lastSnapshot = {}
+
+local function refresh(tab)
+    if tab.snapshot then
+        local snap = tab.snapshot()
+        if snap == lastSnapshot[tab.key] then return end
+        lastSnapshot[tab.key] = snap
+    end
+    state[tab.key] = tab.get()
+    tab.buf:clear()
+    tab.render(tab.buf, state[tab.key])
 end
 
 local frames = 0
 callbacks:add("frame", function()
     frames = frames + 1
     if frames % 15 == 0 then   -- 4 times a second is plenty
-        update()
-        updatePlayer()
-        updateTeam()
-        updateBag()
-        updateBattle()
-        updateLocation()
-        updatePokedex()
+        for _, tab in ipairs(TABS) do
+            refresh(tab)
+        end
     end
 end)
