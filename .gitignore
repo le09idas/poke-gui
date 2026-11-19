@@ -1,33 +1,25 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-poke-gui
+# Never commit game files - users supply their own
+*.gb
+*.gbc
+*.gba
+*.sgb
+*.zip
+*.7z
 
-# Test binary, built with `go test -c`
-*.test
+# Saves and save states
+*.sav
+*.srm
+*.ss[0-9]
+*.ss
 
-# Output of the go coverage tool
-*.out
+# Extracted / exported game graphics (copyrighted - generate locally from your own ROM)
+sprites/
+*.2bpp
+*.pic
 
-# Dependency directories
-vendor/
-
-# Go workspace file
-go.work
-
-# IDE
+# Editor / OS clutter
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
 Thumbs.db
-
-# Fyne build output
-fyne-cross/
+desktop.ini
+.DS_Store
