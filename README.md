@@ -33,6 +33,37 @@ python tools/peek_state.py          # summary of one message
 python tools/peek_state.py --raw    # the whole thing
 ```
 
+## Development setup (Python side)
+
+The GUI is a Python app that uses PySide6, installed in a virtual environment (`.venv/`,
+gitignored).
+
+**First time only** (from the repo root):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+**Every session:**
+
+```powershell
+cd path\to\poke-gui
+.\.venv\Scripts\Activate.ps1       # Git Bash: source .venv/Scripts/activate
+```
+
+Your prompt starts with `(.venv)` when it's active; `python` and `pip` now mean the venv's
+copies. Type `deactivate` (or close the terminal) when you're done.
+
+- **Check you're in the venv:** `python -c "import sys; print(sys.prefix)"` should end in `.venv`.
+- **"Running scripts is disabled on this system"** (PowerShell): run
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, then activate again.
+- **VS Code:** Ctrl+Shift+P → *Python: Select Interpreter* → pick the `.venv` one; new
+  terminals then activate it automatically.
+- **Adding a package:** `python -m pip install <name>`, then add it to `requirements.txt`.
+
 ## Tabs
 
 | Tab | Shows |
